@@ -15,7 +15,13 @@ from .db import get_db
 from .services import (
     DuplicateActivePair,
     MatchGoneError,
+    RallyConflict,
+    RallyError,
+    RallyModeError,
+    RallyNotStarted,
+    RallyWithdrawn,
     active_semifinals,
+    add_rally_point,
     build_state,
     champion,
     create_repair,
@@ -23,11 +29,15 @@ from .services import (
     get_match,
     list_matches,
     move_to_table,
+    rally_session,
+    rally_state,
     record_score,
     repair_from_withdrawn,
     save_group_scores,
+    start_rally,
     swap_semifinal_tables,
     table_map,
+    undo_rally_point,
     withdraw_match,
     match_to_dict,
 )
@@ -108,6 +118,14 @@ def parse_group_json(payload: dict) -> dict:
 
 def state_payload(conn) -> dict:
     s = build_state(conn)
+    rally_pending = bool(
+        s["final_rally"] and s["final_rally"].get("exists")
+        and not s["final_rally"].get("finished")
+    )
+    fm = match_to_dict(s["final_match"])
+    # 逐分记分尚未打到制胜分时，不要把“当前领先”误报成胜者
+    if fm is not None and rally_pending:
+        fm["winner_id"] = None
     return {
         "standings": s["standings"],
         "group_matches": [dict(r) for r in s["group_matches"]],
@@ -115,9 +133,13 @@ def state_payload(conn) -> dict:
         "tables": {str(k): match_to_dict(v) for k, v in s["tables"].items()},
         "active_semifinals": [match_to_dict(r) for r in s["active_semifinals"]],
         "finalists": s["finalists"],
-        "final_match": match_to_dict(s["final_match"]),
+        "final_match": fm,
+        "final_rally": s["final_rally"],
         "champion": s["champion"],
-        "matches": [match_to_dict(r) for r in s["all_matches"]],
+        "matches": [
+            match_to_dict(r, rally_pending=(r["round"] == "F" and rally_pending))
+            for r in s["all_matches"]
+        ],
     }
 
 
@@ -139,22 +161,31 @@ def index():
 
 @bp.get("/matches/<int:match_id>")
 def match_page(match_id: int):
-    m = get_match(get_db(), match_id)
+    conn = get_db()
+    m = get_match(conn, match_id)
     if m is None:
         if wants_json():
             return jsonify(ok=False, error="not_found"), 404
         return render_template("404.html"), 404
     return render_template("match.html", m=m, stale_message=None, error=None,
-                           draft1="", draft2="")
+                           draft1="", draft2="", rally=rally_state(conn, m),
+                           rally_conflict=None, match_notice=None)
 
 
 @bp.get("/history")
 def history():
-    rows = list_matches(get_db())
-    players = get_db().execute(
+    conn = get_db()
+    rows = list_matches(conn)
+    players = conn.execute(
         "SELECT * FROM players ORDER BY group_name, draw_no"
     ).fetchall()
-    return render_template("history.html", matches=rows, players=players)
+    rally_ids = {
+        r["match_id"] for r in conn.execute(
+            "SELECT match_id FROM rally_sessions"
+        ).fetchall()
+    }
+    return render_template("history.html", matches=rows, players=players,
+                           rally_match_ids=rally_ids)
 
 
 @bp.get("/api/state")
@@ -227,7 +258,32 @@ def _score_response(match_id: int, a, b):
             ), 409
         return render_template(
             "match.html", m=exc.match, stale_message=str(exc),
-            error=None, draft1="", draft2=""
+            error=None, draft1="", draft2="",
+            rally=rally_state(conn, exc.match), rally_conflict=None,
+            match_notice=None,
+        ), 409
+    except RallyModeError as exc:
+        if js:
+            return jsonify(
+                ok=False,
+                error="rally_mode_active",
+                code="rally_mode_active",
+                message=str(exc),
+                match_id=match_id,
+                refresh_url=url_for("web.match_page", match_id=match_id),
+            ), 409
+        m = get_match(conn, match_id)
+        notice = None
+        if m is not None and m["round"] == "F" and rally_session(conn, m["id"]):
+            notice = ("这场决赛已开启逐分记分，整场比分提交已被拒绝（HTTP 409 "
+                      "rally_mode_active）。请用同页的逐分记分加分或撤回；"
+                      "如需整场录入，请先撤下决赛再重配。")
+        return render_template(
+            "match.html", m=m, stale_message=None,
+            error=f"{exc}（已拒绝整场比分提交，请改用逐分记分。）",
+            draft1="", draft2="",
+            rally=rally_state(conn, m), rally_conflict=None,
+            match_notice=notice,
         ), 409
     except ScoreError as exc:
         if js:
@@ -236,7 +292,8 @@ def _score_response(match_id: int, a, b):
         m = get_match(conn, match_id)
         return render_template(
             "match.html", m=m, stale_message=None, error=str(exc),
-            draft1=a, draft2=b
+            draft1=a, draft2=b, rally=rally_state(conn, m),
+            rally_conflict=None, match_notice=None,
         ), 400
 
     if js:
@@ -321,6 +378,216 @@ def table_score(table_no: int):
 
 
 # --------------------------------------------------------------------------- #
+# 决赛逐分记分
+# --------------------------------------------------------------------------- #
+
+def _rally_input(conn, match_id: int):
+    return (request.get_json(silent=True) or {}) if request.is_json \
+        else request.form
+
+
+def _rally_origin(data) -> str:
+    origin = str(_pick(data, "origin", "from") or "").strip()
+    if origin in ("home", "match"):
+        return origin
+    ref = request.referrer or ""
+    if ref and (ref.rstrip("/").endswith("/") or ref.endswith("/#finalists")):
+        return "home"
+    return "match"
+
+
+def _rally_page(match_id: int, *, conflict: str | None = None,
+                error: str | None = None, status: int = 200,
+                origin: str = "match"):
+    conn = get_db()
+    m = get_match(conn, match_id)
+    if m is None:
+        return render_template("404.html"), 404
+    if origin == "home":
+        state = build_state(conn)
+        return render_template(
+            "index.html", group_errors=[], draft={},
+            final_rally_conflict=conflict, **state
+        ), status
+    return render_template(
+        "match.html", m=m, stale_message=None, error=error,
+        draft1="", draft2="",
+        rally=rally_state(conn, m), rally_conflict=conflict,
+        match_notice=None,
+    ), status
+
+
+def _start_response(match_id: int):
+    conn = get_db()
+    data = _rally_input(conn, match_id)
+    first = _pick(data, "first_server", "server", "side")
+    origin = _rally_origin(data)
+    try:
+        st = start_rally(conn, match_id, first)
+    except RallyError as exc:
+        if wants_json():
+            return jsonify(ok=False, error="rally_error",
+                           message=str(exc)), 409
+        if origin == "home":
+            flash(str(exc), "err")
+            return redirect(url_for("web.index") + "#finalists")
+        return _rally_page(match_id, error=str(exc), status=409,
+                           origin=origin)
+    if wants_json():
+        return jsonify(ok=True, rally=st,
+                       state=state_payload(conn))
+    flash("逐分记分已开启。点球员名字即可为其加一分。", "ok")
+    if origin == "home":
+        return redirect(url_for("web.index") + "#finalists")
+    return redirect(url_for("web.match_page", match_id=match_id) + "#rally")
+
+
+def _point_response(match_id: int):
+    conn = get_db()
+    data = _rally_input(conn, match_id)
+    side = _pick(data, "side", "player", "winner_side")
+    rev = _pick(data, "revision", "rev", "version")
+    origin = _rally_origin(data)
+    try:
+        st = add_rally_point(conn, match_id, side, rev)
+    except RallyConflict as exc:
+        if wants_json():
+            return jsonify(
+                ok=False, error="rally_conflict", code="rally_stale",
+                message=str(exc), match_id=match_id,
+                rally=rally_state(conn, get_match(conn, match_id)),
+            ), 409
+        return _rally_page(match_id, conflict=str(exc), status=409,
+                           origin=origin)
+    except RallyNotStarted as exc:
+        if wants_json():
+            return jsonify(ok=False, error="rally_not_started",
+                           message=str(exc)), 409
+        if origin == "home":
+            flash(str(exc), "err")
+            return redirect(url_for("web.index") + "#finalists")
+        return _rally_page(match_id, error=str(exc), status=409,
+                           origin=origin)
+    except RallyWithdrawn as exc:
+        if wants_json():
+            return jsonify(ok=False, error="rally_withdrawn",
+                           code="match_withdrawn",
+                           message=str(exc), match_id=match_id), 409
+        if origin == "home":
+            flash(str(exc), "err")
+            return redirect(url_for("web.index"))
+        return _rally_page(match_id, error=str(exc), status=409,
+                           origin=origin)
+    except RallyError as exc:
+        if wants_json():
+            return jsonify(ok=False, error="rally_error",
+                           message=str(exc)), 400
+        if origin == "home":
+            flash(str(exc), "err")
+            return redirect(url_for("web.index") + "#finalists")
+        return _rally_page(match_id, error=str(exc), status=400,
+                           origin=origin)
+    if wants_json():
+        return jsonify(ok=True, rally=st, state=state_payload(conn))
+    if origin == "home":
+        return redirect(url_for("web.index") + "#finalists")
+    return redirect(url_for("web.match_page", match_id=match_id) + "#rally")
+
+
+def _undo_response(match_id: int):
+    conn = get_db()
+    data = _rally_input(conn, match_id)
+    rev = _pick(data, "revision", "rev", "version")
+    origin = _rally_origin(data)
+    try:
+        st = undo_rally_point(conn, match_id, rev)
+    except RallyConflict as exc:
+        if wants_json():
+            return jsonify(
+                ok=False, error="rally_conflict", code="rally_stale",
+                message=str(exc), match_id=match_id,
+                rally=rally_state(conn, get_match(conn, match_id)),
+            ), 409
+        return _rally_page(match_id, conflict=str(exc), status=409,
+                           origin=origin)
+    except RallyNotStarted as exc:
+        if wants_json():
+            return jsonify(ok=False, error="rally_not_started",
+                           message=str(exc)), 409
+        if origin == "home":
+            flash(str(exc), "err")
+            return redirect(url_for("web.index") + "#finalists")
+        return _rally_page(match_id, error=str(exc), status=409,
+                           origin=origin)
+    except RallyWithdrawn as exc:
+        if wants_json():
+            return jsonify(ok=False, error="rally_withdrawn",
+                           code="match_withdrawn",
+                           message=str(exc), match_id=match_id), 409
+        if origin == "home":
+            flash(str(exc), "err")
+            return redirect(url_for("web.index"))
+        return _rally_page(match_id, error=str(exc), status=409,
+                           origin=origin)
+    except RallyError as exc:
+        if wants_json():
+            return jsonify(ok=False, error="rally_error",
+                           message=str(exc)), 400
+        if origin == "home":
+            flash(str(exc), "err")
+            return redirect(url_for("web.index") + "#finalists")
+        return _rally_page(match_id, error=str(exc), status=400,
+                           origin=origin)
+    if wants_json():
+        return jsonify(ok=True, rally=st, state=state_payload(conn))
+    flash("已撤回最近一分。", "ok")
+    if origin == "home":
+        return redirect(url_for("web.index") + "#finalists")
+    return redirect(url_for("web.match_page", match_id=match_id) + "#rally")
+
+
+@bp.post("/matches/<int:match_id>/rally/start")
+def rally_start(match_id: int):
+    return _start_response(match_id)
+
+
+@bp.post("/api/matches/<int:match_id>/rally/start")
+def api_rally_start(match_id: int):
+    return _start_response(match_id)
+
+
+@bp.post("/matches/<int:match_id>/rally/point")
+def rally_point(match_id: int):
+    return _point_response(match_id)
+
+
+@bp.post("/api/matches/<int:match_id>/rally/point")
+def api_rally_point(match_id: int):
+    return _point_response(match_id)
+
+
+@bp.post("/matches/<int:match_id>/rally/undo")
+def rally_undo(match_id: int):
+    return _undo_response(match_id)
+
+
+@bp.post("/api/matches/<int:match_id>/rally/undo")
+def api_rally_undo(match_id: int):
+    return _undo_response(match_id)
+
+
+@bp.get("/api/matches/<int:match_id>/rally")
+def api_rally_state(match_id: int):
+    conn = get_db()
+    m = get_match(conn, match_id)
+    if m is None:
+        return jsonify(ok=False, error="not_found"), 404
+    return jsonify(ok=True, rally=rally_state(conn, m),
+                   match=match_to_dict(m),
+                   champion=champion(conn))
+
+
+# --------------------------------------------------------------------------- #
 # 对调球台 / 换台
 # --------------------------------------------------------------------------- #
 
@@ -370,7 +637,9 @@ def change_table(match_id: int):
                            message=str(exc)), 409
         return render_template(
             "match.html", m=exc.match, stale_message=str(exc),
-            error=None, draft1="", draft2=""
+            error=None, draft1="", draft2="",
+            rally=rally_state(conn, exc.match), rally_conflict=None,
+            match_notice=None,
         ), 409
     else:
         flash(f"场次 #{match_id} 已调到 {table_no} 号台，比分照旧保留。", "ok")

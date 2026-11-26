@@ -83,6 +83,9 @@
             {% if m.status == 'withdrawn' %}
               {{ '小组对阵更新封存' if m.withdraw_reason == 'lineup_update' else '手动撤场' }}
               <br>{{ m.withdrawn_at or '' }}
+            {% elif m.round == 'F' and m.id in rally_match_ids %}
+              <span class="badge badge-active">逐分记分</span>
+              <br>创建 {{ m.created_at }}
             {% else %}
               创建 {{ m.created_at }}
             {% endif %}

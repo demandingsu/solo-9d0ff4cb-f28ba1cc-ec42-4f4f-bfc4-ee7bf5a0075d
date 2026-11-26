@@ -244,6 +244,35 @@ input[type="number"]:focus, select:focus {
 .champion { margin-top: 16px; text-align: center; font-size: 1.5rem;
   font-weight: 900; color: var(--orange-600); }
 
+/* 决赛逐分记分 */
+.rally-panel { margin-top: 16px; border: 1.5px solid #b2e2d2; border-radius: 12px;
+  padding: 16px 18px; background: #fbfffd; }
+.rally-board .rally-head { display: flex; align-items: center;
+  justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.rally-head h3 { margin: 0; }
+.rally-score { display: flex; align-items: center; justify-content: center;
+  gap: 18px; padding: 12px 0 6px; }
+.rally-colon { font-size: 2rem; font-weight: 900; color: var(--ink-400); }
+.rally-side { display: flex; align-items: center; gap: 12px;
+  padding: 8px 16px; border-radius: 12px; border: 2px solid transparent; }
+.rally-side strong { font-size: 2.4rem; font-variant-numeric: tabular-nums;
+  color: var(--green-900); min-width: 40px; text-align: center; }
+.rally-side.serving { border-color: #ffd43b; background: #fff9db; }
+.rally-side.serving::after { content: "发球"; font-size: .72rem; font-weight: 800;
+  color: #9a6a00; background: #ffe066; border-radius: 999px; padding: 1px 8px; }
+.rally-serving { font-weight: 700; margin: 8px 0; }
+.rally-serving.finished { color: var(--orange-600); }
+.rally-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+.rally-actions .btn:disabled { opacity: .45; cursor: not-allowed; }
+.rally-start-form { display: flex; align-items: flex-end; gap: 14px;
+  flex-wrap: wrap; margin-top: 16px; padding: 14px 16px;
+  border: 1.5px dashed #c9dad3; border-radius: 12px; background: #f8fbfa; }
+.rally-start-form h3 { margin: 0; width: 100%; }
+.rally-start-form .hint { width: 100%; margin: 0; }
+.rally-start-form label { display: inline-flex; flex-direction: column;
+  gap: 6px; font-size: .88rem; color: var(--ink-600); }
+.rally-start-form select { width: auto; min-width: 160px; }
+
 /* 封存 / 历史 */
 .sealed-box { margin-top: 16px; background: #fff9f9; border: 1.5px solid #ffc9c9;
   border-radius: 12px; padding: 16px 18px; }

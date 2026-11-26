@@ -10,8 +10,10 @@ from .tournament import (
     ScoreError,
     compute_standings,
     desired_semifinals,
+    is_rally_finished,
     pair_key,
     parse_score_pair,
+    rally_serving_side,
     winner_id,
 )
 
@@ -155,16 +157,294 @@ def final_match(conn: sqlite3.Connection) -> sqlite3.Row | None:
 
 def champion(conn: sqlite3.Connection) -> dict | None:
     f = final_match(conn)
-    if f is None or winner_id(f) is None:
+    if f is None:
+        return None
+    rs = conn.execute(
+        "SELECT * FROM rally_sessions WHERE match_id = ?", (f["id"],)
+    ).fetchone()
+    # 逐分记分进行中（尚未打到制胜分）不产生冠军；
+    # 撤分后比分回到未结束状态，冠军也随之撤下。
+    if rs is not None and not is_rally_finished(rs["score1"], rs["score2"]):
         return None
     wid = winner_id(f)
+    if wid is None:
+        return None
     p = conn.execute("SELECT * FROM players WHERE id = ?", (wid,)).fetchone()
     return {"player": dict(p) if p else None, "match_id": f["id"]}
+
+
+# --------------------------------------------------------------------------- #
+# 决赛逐分记分
+# --------------------------------------------------------------------------- #
+
+class RallyError(Exception):
+    """逐分记分请求不合法（未开始、已结束、已登记整场比分等）。"""
+
+
+class RallyNotStarted(RallyError):
+    pass
+
+
+class RallyConflict(RallyError):
+    """页面持有的 revision 落后：同一进度已被另一张页面改过。"""
+
+
+class RallyWithdrawn(RallyError):
+    """决赛场次已撤下，逐分记分入口关闭（409）。"""
+
+    def __init__(self, message: str, *, match=None):
+        super().__init__(message)
+        self.match = match
+
+
+class RallyModeError(RallyError):
+    """决赛已开启逐分记分，拒绝整场比分的网页表单/API 录入。"""
+
+
+def rally_session(conn: sqlite3.Connection, match_id: int):
+    return conn.execute(
+        "SELECT * FROM rally_sessions WHERE match_id = ?", (match_id,)
+    ).fetchone()
+
+
+def rally_state(conn: sqlite3.Connection, match: sqlite3.Row | None) -> dict | None:
+    """组装逐分记分状态，供页面与 JSON 共用（match 为 None 时返回 None）。"""
+    if match is None:
+        return None
+    rs = rally_session(conn, match["id"])
+    if rs is None:
+        return {
+            "exists": False,
+            "match_id": match["id"],
+            "can_start": (
+                match["status"] == "active"
+                and match["round"] == "F"
+                and match["score1"] is None
+                and match["score2"] is None
+            ),
+        }
+
+    s1, s2 = rs["score1"], rs["score2"]
+    finished = is_rally_finished(s1, s2)
+    if finished:
+        winner_side = 1 if s1 > s2 else 2
+    else:
+        winner_side = None
+    last_point = conn.execute(
+        """SELECT * FROM rally_points
+            WHERE match_id = ? AND undone_at IS NULL
+            ORDER BY seq DESC LIMIT 1""",
+        (match["id"],),
+    ).fetchone()
+    return {
+        "exists": True,
+        "match_id": match["id"],
+        "first_server": rs["first_server"],
+        "score1": s1,
+        "score2": s2,
+        "revision": rs["revision"],
+        "serving_side": rally_serving_side(s1, s2, rs["first_server"]),
+        "finished": finished,
+        "winner_side": winner_side,
+        "can_undo": last_point is not None,
+        "last_point_side": last_point["side"] if last_point else None,
+        "points_played": s1 + s2,
+        "started_at": rs["started_at"],
+        "updated_at": rs["updated_at"],
+        "can_start": False,
+        "active": match["status"] == "active",
+    }
+
+
+def _sync_match_score(
+    conn: sqlite3.Connection, match_id: int, score1: int, score2: int
+) -> None:
+    conn.execute(
+        "UPDATE matches SET score1=?, score2=?, updated_at=? WHERE id=?",
+        (score1, score2, now_iso(), match_id),
+    )
+
+
+def _begin_immediate(conn: sqlite3.Connection) -> None:
+    """拿到写锁后再做“读-判断-写”，让并发请求真正串行。"""
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+
+
+def start_rally(
+    conn: sqlite3.Connection, match_id: int, first_server: Any
+) -> dict:
+    """为“尚未登记整场比分的现行决赛”开启逐分记分，并选定首发球员。"""
+    try:
+        first_server = int(first_server)
+    except (TypeError, ValueError):
+        raise RallyError("首发球员只能是 1（左侧球员）或 2（右侧球员）。")
+    if first_server not in (1, 2):
+        raise RallyError("首发球员只能是 1（左侧球员）或 2（右侧球员）。")
+
+    _begin_immediate(conn)
+    try:
+        m = get_match(conn, match_id)
+        if m is None:
+            raise RallyError("场次不存在。")
+        if m["status"] != "active":
+            raise RallyError("该场已撤下，不能开启逐分记分。")
+        if m["round"] != "F":
+            raise RallyError("逐分记分只用于决赛。")
+        if rally_session(conn, match_id) is not None:
+            raise RallyError("这场决赛已经开启逐分记分。")
+        if m["score1"] is not None or m["score2"] is not None:
+            raise RallyError(
+                "这场决赛已经登记了整场比分，不能再开启逐分记分。"
+                "如需逐分记分，请先撤下并重新生成决赛。"
+            )
+
+        ts = now_iso()
+        conn.execute(
+            """INSERT INTO rally_sessions
+               (match_id, first_server, score1, score2, revision,
+                started_at, updated_at)
+               VALUES (?, ?, 0, 0, 1, ?, ?)""",
+            (match_id, first_server, ts, ts),
+        )
+        _sync_match_score(conn, match_id, 0, 0)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return rally_state(conn, get_match(conn, match_id))
+
+
+def _rally_match_for_write(conn: sqlite3.Connection, match_id: int) -> sqlite3.Row:
+    m = get_match(conn, match_id)
+    if m is None:
+        raise RallyError("场次不存在。")
+    if m["status"] != "active":
+        raise RallyWithdrawn("该场已撤下，逐分记分已关闭，请刷新页面。", match=m)
+    if m["round"] != "F":
+        raise RallyError("逐分记分只用于决赛。")
+    return m
+
+
+def add_rally_point(
+    conn: sqlite3.Connection, match_id: int, side: Any, expected_revision: Any
+) -> dict:
+    """给一方加一分。revision 必须等于页面加载时的版本，否则视为旧页面。"""
+    try:
+        side = int(side)
+        expected_revision = int(expected_revision)
+    except (TypeError, ValueError):
+        raise RallyError("加分参数无效。")
+    if side not in (1, 2):
+        raise RallyError("加分方只能是 1 或 2。")
+
+    _begin_immediate(conn)
+    try:
+        _rally_match_for_write(conn, match_id)
+        rs = rally_session(conn, match_id)
+        if rs is None:
+            raise RallyNotStarted("这场决赛还没有开启逐分记分。")
+        if rs["revision"] != expected_revision:
+            raise RallyConflict("比分进度已被另一张页面更新，请刷新页面后再操作。")
+        if is_rally_finished(rs["score1"], rs["score2"]):
+            raise RallyError("本场已经分出胜负，不能再加分；如需更正请撤回最近一分。")
+
+        s1, s2 = rs["score1"], rs["score2"]
+        if side == 1:
+            s1 += 1
+        else:
+            s2 += 1
+
+        seq = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM rally_points WHERE match_id = ?",
+            (match_id,),
+        ).fetchone()[0]
+        ts = now_iso()
+        # 条件 UPDATE 再兜一层：只有 revision 仍等于期望值才真正写入。
+        cur = conn.execute(
+            """UPDATE rally_sessions
+                  SET score1 = ?, score2 = ?, revision = revision + 1,
+                      updated_at = ?
+                WHERE match_id = ? AND revision = ?""",
+            (s1, s2, ts, match_id, expected_revision),
+        )
+        if cur.rowcount != 1:
+            raise RallyConflict("比分进度已被另一张页面更新，请刷新页面后再操作。")
+        conn.execute(
+            """INSERT INTO rally_points
+               (match_id, seq, side, created_at) VALUES (?, ?, ?, ?)""",
+            (match_id, seq, side, ts),
+        )
+        _sync_match_score(conn, match_id, s1, s2)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return rally_state(conn, get_match(conn, match_id))
+
+
+def undo_rally_point(
+    conn: sqlite3.Connection, match_id: int, expected_revision: Any
+) -> dict:
+    """撤回最近一分（包括制胜分；撤回后恢复记分）。"""
+    try:
+        expected_revision = int(expected_revision)
+    except (TypeError, ValueError):
+        raise RallyError("撤回参数无效。")
+
+    _begin_immediate(conn)
+    try:
+        _rally_match_for_write(conn, match_id)
+        rs = rally_session(conn, match_id)
+        if rs is None:
+            raise RallyNotStarted("这场决赛还没有开启逐分记分。")
+        if rs["revision"] != expected_revision:
+            raise RallyConflict("比分进度已被另一张页面更新，请刷新页面后再操作。")
+
+        last = conn.execute(
+            """SELECT * FROM rally_points
+                WHERE match_id = ? AND undone_at IS NULL
+                ORDER BY seq DESC LIMIT 1""",
+            (match_id,),
+        ).fetchone()
+        if last is None:
+            raise RallyError("当前没有可撤回的得分。")
+
+        s1, s2 = rs["score1"], rs["score2"]
+        if last["side"] == 1:
+            s1 -= 1
+        else:
+            s2 -= 1
+        if s1 < 0 or s2 < 0:
+            raise RallyError("比分状态异常，无法撤回。")
+
+        ts = now_iso()
+        cur = conn.execute(
+            """UPDATE rally_sessions
+                  SET score1 = ?, score2 = ?, revision = revision + 1,
+                      updated_at = ?
+                WHERE match_id = ? AND revision = ?""",
+            (s1, s2, ts, match_id, expected_revision),
+        )
+        if cur.rowcount != 1:
+            raise RallyConflict("比分进度已被另一张页面更新，请刷新页面后再操作。")
+        conn.execute(
+            "UPDATE rally_points SET undone_at = ? WHERE id = ?",
+            (ts, last["id"]),
+        )
+        _sync_match_score(conn, match_id, s1, s2)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return rally_state(conn, get_match(conn, match_id))
 
 
 def build_state(conn: sqlite3.Connection) -> dict:
     st = standings(conn)
     desired = desired_semifinals(st)
+    f = final_match(conn)
     return {
         "standings": st,
         "group_matches": list_group_matches(conn),
@@ -172,19 +452,23 @@ def build_state(conn: sqlite3.Connection) -> dict:
         "tables": table_map(conn),
         "active_semifinals": active_semifinals(conn),
         "finalists": finalists_state(conn),
-        "final_match": final_match(conn),
+        "final_match": f,
+        "final_rally": rally_state(conn, f),
         "champion": champion(conn),
         "all_matches": list_matches(conn),
     }
 
 
-def match_to_dict(row: sqlite3.Row | None) -> dict | None:
+def match_to_dict(
+    row: sqlite3.Row | None, *, rally_pending: bool = False
+) -> dict | None:
+    """JSON 形态的场次。rally_pending=True 时比分只是逐分进行中的临时数，
+    不把它当作已分胜负（避免把当前领先方误报为胜者）。"""
     if row is None:
         return None
     d = dict(row)
-    d["winner_id"] = winner_id(row)
+    d["winner_id"] = None if rally_pending else winner_id(row)
     return d
-
 
 # --------------------------------------------------------------------------- #
 # 小组赛：整表提交
@@ -253,6 +537,13 @@ def _insert_match(
     return int(cur.lastrowid)
 
 
+def _delete_match_rows(conn: sqlite3.Connection, match_id: int) -> None:
+    """删除一条未记分的自动空壳场次；逐分流水一并清掉，避免外键残留。"""
+    conn.execute("DELETE FROM rally_points WHERE match_id = ?", (match_id,))
+    conn.execute("DELETE FROM rally_sessions WHERE match_id = ?", (match_id,))
+    conn.execute("DELETE FROM matches WHERE id=?", (match_id,))
+
+
 def reconcile_semifinals(conn: sqlite3.Connection) -> None:
     """按最新排名把两条规则对阵与现行场次记录调和。
 
@@ -299,7 +590,7 @@ def reconcile_semifinals(conn: sqlite3.Connection) -> None:
                 (now_iso(), m["id"]),
             )
         else:
-            conn.execute("DELETE FROM matches WHERE id=?", (m["id"],))
+            _delete_match_rows(conn, m["id"])
 
     # 生成缺失对阵
     occupied_tables = {
@@ -340,7 +631,7 @@ def reconcile_final(conn: sqlite3.Connection) -> None:
         # 选手尚未确定：未记分的空壳决赛记录删掉；记过分的封存
         for m in current:
             if m["score1"] is None and m["score2"] is None:
-                conn.execute("DELETE FROM matches WHERE id=?", (m["id"],))
+                _delete_match_rows(conn, m["id"])
             else:
                 conn.execute(
                     "UPDATE matches SET status='withdrawn',"
@@ -356,7 +647,7 @@ def reconcile_final(conn: sqlite3.Connection) -> None:
         return
     for m in current:
         if m["score1"] is None and m["score2"] is None:
-            conn.execute("DELETE FROM matches WHERE id=?", (m["id"],))
+            _delete_match_rows(conn, m["id"])
         else:
             conn.execute(
                 "UPDATE matches SET status='withdrawn',"
@@ -381,30 +672,49 @@ class MatchGoneError(Exception):
         self.match = match
 
 
+def rally_mode_active(conn: sqlite3.Connection, match_id: int) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM rally_sessions WHERE match_id = ?", (match_id,)
+    ).fetchone() is not None
+
+
 def record_score(
     conn: sqlite3.Connection, match_id: int, raw1: Any, raw2: Any
 ) -> sqlite3.Row:
-    m = get_match(conn, match_id)
-    if m is None:
-        raise MatchGoneError("场次不存在。")
-    if m["status"] != "active":
-        raise MatchGoneError(
-            "这张页面上的对阵已经撤下，比分入口关闭。请刷新页面，按最新对阵记分。",
-            withdrawn=True,
-            match=m,
-        )
-    s1, s2 = parse_score_pair(raw1, raw2)
-    if s1 is None:
-        raise ScoreError("半决赛/决赛必须登记完整比分（两格都填）。")
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        m = get_match(conn, match_id)
+        if m is None:
+            raise MatchGoneError("场次不存在。")
+        if m["status"] != "active":
+            raise MatchGoneError(
+                "这张页面上的对阵已经撤下，比分入口关闭。请刷新页面，按最新对阵记分。",
+                withdrawn=True,
+                match=m,
+            )
+        # 逐分记分开启后，整场比分的网页表单/API 一律拒绝。
+        if rally_mode_active(conn, match_id):
+            raise RallyModeError(
+                "这场决赛已开启逐分记分，不能再整场提交比分。"
+                "请到逐分记分页加分或撤回，或刷新页面。"
+            )
+        s1, s2 = parse_score_pair(raw1, raw2)
+        if s1 is None:
+            raise ScoreError("半决赛/决赛必须登记完整比分（两格都填）。")
 
-    conn.execute(
-        "UPDATE matches SET score1=?, score2=?, updated_at=? WHERE id=?",
-        (s1, s2, now_iso(), match_id),
-    )
-    # 半决赛比分变化可能改变决赛选手
-    if m["round"] == "SF":
-        reconcile_final(conn)
-    conn.commit()
+        conn.execute(
+            "UPDATE matches SET score1=?, score2=?, updated_at=? WHERE id=?",
+            (s1, s2, now_iso(), match_id),
+        )
+        # 半决赛比分变化可能改变决赛选手
+        if m["round"] == "SF":
+            reconcile_final(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     return get_match(conn, match_id)
 
 

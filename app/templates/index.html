@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_rally.html" as rally_ui %}
 {% block content %}
 
 {% macro score_form(m, compact=False) %}
@@ -217,18 +218,37 @@
       </div>
 
       {% if final_match %}
-      <div class="final-score">
-        <h3>决赛（场次 #{{ final_match.id }}）</h3>
+      <div class="final-score" data-testid="final-score">
+        <h3>决赛（场次 #{{ final_match.id }}）
+          {% if final_rally and final_rally.exists and not final_rally.finished %}
+            <span class="badge badge-repair" data-testid="final-in-progress">逐分进行中</span>
+          {% elif final_rally and final_rally.exists and final_rally.finished %}
+            <span class="badge badge-active" data-testid="final-finished">已结束</span>
+          {% endif %}
+        </h3>
         <div class="versus">
           <div class="vs-player"><span class="pname">{{ final_match.player1_name }}</span></div>
           <div class="vs-score">
             {% if final_match.score1 is not none %}
-              <strong>{{ final_match.score1 }}</strong> : <strong>{{ final_match.score2 }}</strong>
+              <strong data-testid="final-score-1">{{ final_match.score1 }}</strong> :
+              <strong data-testid="final-score-2">{{ final_match.score2 }}</strong>
             {% else %}<span class="muted">未记分</span>{% endif %}
           </div>
           <div class="vs-player"><span class="pname">{{ final_match.player2_name }}</span></div>
         </div>
-        {{ score_form(final_match) }}
+
+        {{ rally_ui.rally_panel(final_match, final_rally, final_rally_conflict|default(none), 'home') }}
+        {% if final_rally and final_rally.exists %}
+          <div class="alert alert-stale" data-testid="final-mode-notice">
+            这场决赛已开启逐分记分：整场比分表单和 API 均已被关闭（HTTP 409
+            <code>rally_mode_active</code>），请点上方球员按钮加分，或用“撤回最近一分”更正。
+          </div>
+        {% endif %}
+
+        {% if not final_rally or not final_rally.exists %}
+          {{ score_form(final_match) }}
+          <p class="hint">也可以不整场录入，改用上面的逐分记分：先选首发球员，再一分一分地记。</p>
+        {% endif %}
       </div>
       {% endif %}
 

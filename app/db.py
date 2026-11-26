@@ -66,6 +66,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_active_pair
 CREATE UNIQUE INDEX IF NOT EXISTS uq_active_table
     ON matches(round, table_no)
     WHERE status = 'active' AND table_no IS NOT NULL;
+
+-- 决赛逐分记分：每场决赛至多一个会话，保存当前比分、首发方和单调递增版本号。
+-- revision 每加/撤一分都 +1，供两张页面做“同一进度只允许一笔生效”的乐观校验。
+CREATE TABLE IF NOT EXISTS rally_sessions (
+    match_id     INTEGER PRIMARY KEY REFERENCES matches(id),
+    first_server INTEGER NOT NULL CHECK (first_server IN (1, 2)),
+    score1       INTEGER NOT NULL DEFAULT 0,
+    score2       INTEGER NOT NULL DEFAULT 0,
+    revision     INTEGER NOT NULL DEFAULT 1,
+    started_at   TEXT    NOT NULL,
+    updated_at   TEXT
+);
+
+-- 逐分流水：撤回时标记 undone_at（保留可追溯），不使用物理删除。
+CREATE TABLE IF NOT EXISTS rally_points (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id   INTEGER NOT NULL REFERENCES matches(id),
+    seq        INTEGER NOT NULL,
+    side       INTEGER NOT NULL CHECK (side IN (1, 2)),
+    created_at TEXT    NOT NULL,
+    undone_at  TEXT,
+    UNIQUE (match_id, seq)
+);
 """
 
 # 内置六名球员与抽签号（抽签号全局唯一，升序即小号在前）

@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_rally.html" as rally_ui %}
 {% block title %}场次 #{{ m.id }} · 裁判台{% endblock %}
 {% block content %}
 
@@ -44,6 +45,9 @@
     {% if error %}
     <div class="alert alert-error" data-testid="score-error">{{ error }}</div>
     {% endif %}
+    {% if match_notice %}
+    <div class="alert alert-stale" data-testid="match-notice">{{ match_notice }}</div>
+    {% endif %}
 
     <div class="versus versus-lg">
       <div class="vs-player">
@@ -66,9 +70,25 @@
     </div>
 
     {% if m.status == 'active' %}
+      {% if m.round == 'F' and rally and rally.exists and not match_notice %}
+        {{ rally_ui.rally_panel(m, rally, rally_conflict) }}
+        <div class="alert alert-stale" data-testid="rally-mode-notice">
+          这场决赛已开启逐分记分，整场比分的网页表单已关闭（API 同样拒绝，返回
+          HTTP 409 <code>rally_mode_active</code>）。请用上方逐分记分。
+        </div>
+        <div class="mini-actions">
+          <form method="post" action="{{ url_for('web.withdraw', match_id=m.id) }}"
+                class="inline-form"
+                onsubmit="return confirm('确认撤下决赛？逐分记录与比分将封存。');">
+            <button class="btn btn-danger btn-sm" type="submit"
+                    data-testid="withdraw-{{ m.id }}">撤下决赛</button>
+          </form>
+        </div>
+      {% else %}
       <form method="post" class="score-form score-form-lg"
             action="{{ url_for('web.match_score', match_id=m.id) }}"
-            data-testid="score-form-{{ m.id }}">
+            data-testid="score-form-{{ m.id }}"
+            {% if m.round == 'F' and rally and rally.exists %}hidden{% endif %}>
         <input type="number" name="score1" min="0" max="999" inputmode="numeric"
                value="{{ draft1 if draft1 else (m.score1 if m.score1 is not none else '') }}"
                aria-label="{{ m.player1_name }} 得分">
@@ -80,6 +100,11 @@
           {{ '保存 / 更正比分' if (m.score1 is not none or m.score2 is not none) else '提交比分' }}
         </button>
       </form>
+
+      {% if m.round == 'F' %}
+        {{ rally_ui.rally_panel(m, rally, rally_conflict) }}
+        <p class="hint">决赛可以整场录入比分，也可以先选首发球员再逐分记分；一旦开启逐分记分，整场比分入口就会关闭。</p>
+      {% endif %}
       <p class="hint">本页地址固定为 <code>/matches/{{ m.id }}</code>。只要场次未撤下，即使球台对调，用这张旧页面交分仍然有效，比分依旧记在这两位球员的本场记录上。</p>
 
       <div class="mini-actions">
@@ -100,6 +125,7 @@
                   data-testid="withdraw-{{ m.id }}">撤下对阵</button>
         </form>
       </div>
+      {% endif %}
     {% else %}
       <div class="sealed-box" data-testid="sealed-box">
         <h3>该场次已撤下，比分封存保留、仍可查询</h3>

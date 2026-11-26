@@ -3,7 +3,8 @@
 一个可直接用 Docker Compose 启动的社区乒乓球赛裁判 Web 台：Flask + 服务端渲染 + SQLite，
 无外部服务、无前端构建。内置 A、B 两组各三人的单循环赛程（共六场），支持整表录入/更正、
 自动排名、半决赛对阵、按场记分、球台对调、撤场封存、同两人重新配对、旧页面交分裁决，
-并在两场现行半决赛都有比分后才显示决赛选手（另附轻量决赛/冠军）。
+并在两场现行半决赛都有比分后才显示决赛选手；决赛支持**逐分记分**（选定首发球员、
+加分/撤回、两分换发、10 平后每分换发、11 分且领先 2 分结束），首页展示决赛比分与冠军。
 
 ---
 
@@ -37,11 +38,15 @@ python wsgi.py
 
 ```bash
 pip install pytest
-pytest -q                                   # 15 个行为测试
+pytest -q                                   # 28 个行为测试（15 原有 + 13 逐分记分）
 
-# 先起服务，再跑纯标准库黑盒剧本（对调球台 + 撤场重配 + 旧页交分）
+# 先起服务，再跑纯标准库黑盒剧本（对调球台 + 撤场重配 + 旧页交分 + 决赛逐分记分）
 DB_PATH=/tmp/trial.db gunicorn --bind 127.0.0.1:5555 --preload wsgi:app &
 python scripts/e2e_trial.py http://127.0.0.1:5555
+
+# 并发加分/撤回压测（同一 revision 多线程同时提交，只允许一笔生效）
+DB_PATH=/tmp/race.db gunicorn --bind 127.0.0.1:5556 --preload wsgi:app &
+python scripts/race_check.py http://127.0.0.1:5556
 ```
 
 ---
@@ -112,6 +117,10 @@ python scripts/e2e_trial.py http://127.0.0.1:5555
 | 撤下对阵 | `POST /matches/<id>/withdraw` | `POST /api/matches/<id>/withdraw` |
 | 原班两人重新配对 | `POST /matches/<id>/re-pair`（兼容别名 `/repait`） | `POST /api/matches/<id>/repait` |
 | 任意两人新建配对 | `POST /pairings` | 同名，JSON |
+| 决赛开启逐分记分（选首发方 `first_server`） | `POST /matches/<id>/rally/start` | `POST /api/matches/<id>/rally/start` |
+| 决赛加一分（`side` 1/2 + `revision`） | `POST /matches/<id>/rally/point` | `POST /api/matches/<id>/rally/point` |
+| 决赛撤回最近一分（`revision`） | `POST /matches/<id>/rally/undo` | `POST /api/matches/<id>/rally/undo` |
+| 决赛逐分状态 | 页面/JSON 状态里含 `final_rally` | `GET /api/matches/<id>/rally` |
 
 另提供语义别名 `POST /semifinals/<id>/score`、`POST /semifinal/<id>/score`、`POST /swap-tables`。
 
@@ -120,7 +129,26 @@ python scripts/e2e_trial.py http://127.0.0.1:5555
 
 决赛选手判定：现行半决赛**恰好两场且两场都有可分胜负的比分**时，
 `#finalists` 区域才显示两位决赛选手；否则显示 `已完成 x/y` 与原因。
-决赛选手产生后会出现轻量决赛记分与冠军横幅（加分项）。
+决赛选手产生后，决赛有两种入口：整场录入比分，或**逐分记分**（见下节）。
+
+### 4.1 决赛逐分记分
+
+- 只能对**尚未登记整场比分的现行决赛**开启；开启时必须选定首发球员（1=左侧/2=右侧）。
+- 加分/撤回都带 `revision`（页面渲染时的进度版本）；两张页面（首页决赛区与
+  `/matches/<id>`）从同一进度操作，**只有第一笔生效**，后一笔返回 HTTP 409
+  `code=rally_stale` 并提示刷新。版本号每次加/撤都 +1，所以**即使撤分后比分回到原样，
+  旧页面再提交仍会被拒**。
+- 应发球员：开局由首发方发球，每打两分换发；双方均到 10 分后改为每分换发
+  （10 平时的发球方沿用原来的两分轮转）。
+- 结束：一方至少 11 分且领先 2 分及以上时停止加分（再点加分会被拒）；
+  打到制胜分即产生冠军，首页显示决赛比分与冠军。
+- 撤回制胜分后恢复记分（`finished=false`），首页的冠军横幅随即撤下；可以继续加分再次结束。
+- 逐分记分开启后，`/matches/<id>/score`、`/tables/<n>/score` 等整场比分入口与
+  `/api/matches/<id>/score` 一律返回 HTTP 409 `code=rally_mode_active`；
+  首页与场次页会把整场比分表单换成逐分记分面板。
+- 数据：`rally_sessions`（每场至多一行：首发方、比分、revision）+ `rally_points`
+  （逐分流水，撤回只标记 `undone_at`，不物理删除）。写入用 `BEGIN IMMEDIATE`
+  拿写锁后再校验 revision，并在 `UPDATE ... WHERE revision=?` 上做条件更新兜底。
 
 ---
 
@@ -138,40 +166,56 @@ python scripts/e2e_trial.py http://127.0.0.1:5555
 - ✅ **同两人重新配对生成全新空白场次，重新记分**；重复的现行同对配对会被 409/提示拦截。
 - ✅ **已撤下场次的旧页面交分被退回 HTTP 409，并明确提示“刷新页面”**（HTML 与 JSON 双形态）。
 - ✅ 两场现行半决赛都有比分后才显示决赛选手；未满足时显示进度与原因。
-- ✅ 额外：单场换台、通用配对、决赛记分/冠军、完整 JSON API、15 个 pytest 用例、黑盒试跑脚本。
+- ✅ **决赛逐分记分**：选定首发球员后点球员加分、撤回最近一分；页面显示当前比分与应发球员；
+  每两分换发、10 平起每分换发；11 分且领先 2 分停止加分；首页显示决赛比分和冠军；
+  撤回制胜分后恢复记分并撤下冠军；开启后整场比分表单与 API 均被 409 拒绝；
+  两张页面同一进度只允许一笔生效，撤分回到原样后旧页面提交也提示刷新。
+- ✅ 额外：单场换台、通用配对、决赛记分/冠军、完整 JSON API、28 个 pytest 用例、黑盒试跑与并发压测脚本。
 
 ### 5.2 实际测了什么（都是本环境真实执行，非仅阅读代码）
 
-- ✅ `pytest -q`：**15 passed**。覆盖播种、连环套同胜场按抽签号排名、规则对阵、
-  整表非法时原子不写库、决赛选手显示条件、换台比分随人走、旧球台入口按 match_id/球员对解析、
-  撤下/历史可查/重配空白/旧页 409 且“刷新”、JSON `match_withdrawn`、
-  小组改排名时旧半决赛“空壳删除 / 有比分封存”、对调所需场次数量校验等。
+- ✅ `pytest -q`：**28 passed**。原有 15 项回归全绿；新增 13 项覆盖：
+  换发轮转纯函数、结束条件、只能在未记分的现行决赛开启、
+  已登记整场比分不能再开逐分、开启后网页/JSON/球台入口整场比分均 409、
+  场次页表单切换、加分/换发/10 平/结束与冠军、撤回制胜分恢复并撤冠、首页面板也能加分、
+  两页同 revision 只有一笔生效、撤分回到原样后旧页面仍 409 并提示刷新、撤下决赛关闭逐分、
+  逐分进行中 JSON 不把当前领先方误报为胜者（结束/撤冠时 winner_id 与 champion 保持一致）。
 - ✅ `python scripts/e2e_trial.py http://127.0.0.1:5555`：对**真实 gunicorn
   （2 workers + threads + `--preload`）+ 文件 SQLite** 跑纯 HTTP 黑盒剧本，
-  **32 项检查全部通过**，完整执行了题目点名的流程：
-  整表提交 → 排名/对阵正确 → 旧页面登记 3:1 → 对调球台（m1 移到二号台且 3:1 保留）→
-  用同一张旧页面更正为 3:2 成功 → 旧一号台上下文交分成功且记在原球员对名下 →
-  撤下 m1（比分 3:0 封存）→ 历史页可见 `3 : 0` → 原班两人重配出全新空白场次 →
-  **再用旧页面交分收到 409 + “刷新”提示，封存比分未被改动** → 新场记分 + 另一场记分 →
-  两位决赛选手（陈一鸣、林浩然）上首页。
-- ✅ 实跑 `docker-entrypoint.sh` 的初始化命令，确认生成 6 球员 / 6 小组赛 / 2 场 SF。
-- ✅ 用 PyYAML 解析校验 `docker-compose.yml`，并用 JSON 解析校验 Dockerfile exec-form `CMD`。
+  **54 项检查全部通过**。前半段是原有回归：
+  整表提交 → 排名/对阵 → 旧页面登记/对调/撤下/重配/旧页 409 → 两位决赛选手上首页。
+  后半段按题面从决赛页自测：选首发开启逐分 → 开启后网页表单与 API 整场比分均 409 →
+  首页与场次页读到同一 revision → 两页先后提交，第二笔 409 + 刷新提示、只 1:0 生效 →
+  打到 10:10 → 10 平后 11:10 / 11:11 每分换发 → 13:11 自动停止加分、首页比分与冠军 →
+  撤回制胜分回到 12:11 恢复记分且冠军撤下 → 旧版本再提交 409 `rally_stale` →
+  再得两分重新结束、冠军恢复。
+- ✅ `python scripts/race_check.py http://127.0.0.1:5558`：对真实 gunicorn
+  （2 workers × 4 threads）用 16 线程并发发起 32 次同 revision 加分，**恰好 1 次 200、
+  31 次 409**，比分只加 1 分；随后 16 次并发撤回也**恰好 1 次生效**。
+- ✅ 用 `docker-entrypoint.sh` 的真实入口（`python3 -c "from app.db import bootstrap"`）
+  在本机起 gunicorn 跑完整黑盒剧本，同样 54 项全过；试跑日志无 traceback / 500。
+- ✅ 实跑 `docker-entrypoint.sh` 的初始化命令，确认生成 6 球员 / 6 小组赛 / 2 场 SF，
+  以及新增的 `rally_sessions` / `rally_points` 表。
+- ✅ 静态校验 `docker-compose.yml` 的关键结构，并用 JSON 解析校验 Dockerfile exec-form `CMD`。
 - ✅ 所有 Python 文件 `py_compile` 通过；试跑期间 gunicorn 无 traceback / 500
   （仅有一条本沙箱 `HOME` 不可写导致的 gunicorn 控制套接字权限提示，与业务无关）。
 
 ### 5.3 还有什么没做 / 已知边界（如实说明）
 
 - ⚠️ **本沙箱没有 docker / podman / 守护进程与 socket，无法在这里真正
-  `docker compose build && docker compose up`**。Compose/Dockerfile 仅做了静态校验，
-  并用与镜像相同的 `gunicorn ... wsgi:app` 命令在本机完整试跑；镜像内的 `pip install`
-  未实跑（但 `requirements.txt` 中的 Flask/gunicorn 已从 PyPI 在本机成功安装并验证）。
-  首次在有 Docker 的机器上构建时仍可能遇到网络/拉取基础镜像问题。
+  `docker compose build && docker compose up`**。已用仓库里的 `docker-entrypoint.sh`
+  实际初始化数据库，并用与镜像相同的 `gunicorn ... wsgi:app` 命令起服务跑完整黑盒剧本；
+  Compose/Dockerfile 做过静态校验。镜像内的 `pip install` 未实跑（Flask/gunicorn 已在
+  本机安装验证），首次在有 Docker 的机器上构建仍可能遇到网络/拉取基础镜像问题。
 - 未做登录、裁判身份与权限控制（定位为社区内网裁判台，拿到页面即可操作）。
-- 比分只记每场两个总数，未记录逐局小分、暂停、黄牌等明细。
+- 小组/半决赛仍只记每场两个总数；**逐分明细只在决赛提供**，未做逐局（game）小分、
+  暂停、黄牌等。逐分记分一旦开启，不能切回“整场录入”，只能撤下决赛后重新生成。
 - 小组赛六场是固定行原地更新，**不保留每次修改的历史版本**；淘汰赛的撤下/对阵更新则有状态、
   原因与时间戳可追溯，但也不是完整审计日志。
-- 并发控制依赖 SQLite 事务 + `busy_timeout` + 两个部分唯一索引，没有实现乐观锁版本号；
-  “旧页面”裁决依据是稳定场次 id 与 active/withdrawn 状态（正合题面语义）。
+- 并发控制：场次撤下/重配仍靠 SQLite 事务 + `busy_timeout` + 部分唯一索引；
+  逐分记分新增了 revision 乐观锁（`BEGIN IMMEDIATE` + 条件 UPDATE），并发压测已验证。
+  未做 WebSocket/SSE 实时推送，另一张页面要等下一次提交或手动刷新才会看到最新比分。
+- 逐分记分不提供“修改更早某一分”，只能从最近一分往回撤；也没有记分员/裁判双人复核。
 - 决赛/冠军为轻量加分项；未做季军赛、签表导出、打印海报、CSV 导出等。
 - 没有浏览器级/视觉自动化测试（环境无 Playwright/Node 测试链），页面为服务端渲染，
   仅含确认框等少量原生 JS；未做多语言（仅中文）。

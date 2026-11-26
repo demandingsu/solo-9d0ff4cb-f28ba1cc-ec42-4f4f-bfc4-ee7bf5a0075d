@@ -136,6 +136,47 @@ def desired_semifinals(standings: dict[str, list[dict]]) -> list[dict]:
     ]
 
 
+# --------------------------------------------------------------------------- #
+# 决赛逐分记分规则（纯函数，便于测试）
+# --------------------------------------------------------------------------- #
+
+RALLY_WIN_POINTS = 11      # 一方至少 11 分
+RALLY_WIN_MARGIN = 2       # 且领先 2 分或以上
+RALLY_DEUCE_START = 10     # 10 平起每分换发
+
+
+def is_rally_finished(score1: int, score2: int) -> bool:
+    """一方至少 11 分且领先 2 分或以上 => 停止加分。"""
+    return (
+        max(score1, score2) >= RALLY_WIN_POINTS
+        and abs(score1 - score2) >= RALLY_WIN_MARGIN
+    )
+
+
+def rally_serving_side(score1: int, score2: int, first_side: int) -> int:
+    """返回当前这一分应由哪一方发球（1 或 2）。
+
+    规则：
+      - 开局由首发方发球，每打两分换发；
+      - 10 平（双方均 >= 10）起，改为每一分换发；
+      - 10 平时的发球方沿用原来的两分轮转顺序（第 21 分仍由首发方发球），
+        之后每分交替。
+
+    ``first_side`` 是首发方（1=player1，2=player2）。返回值是发球方。
+    """
+    if first_side not in (1, 2):
+        raise ValueError("first_side 只能是 1 或 2。")
+    total = score1 + score2
+    order = (first_side, 3 - first_side)
+    if score1 >= RALLY_DEUCE_START and score2 >= RALLY_DEUCE_START:
+        # 10 平：total=20 时仍按原轮转由首发方发球，之后每分换发
+        pos = (total - 2 * RALLY_DEUCE_START) % 2
+    else:
+        # 每打两分换发
+        pos = (total // 2) % 2
+    return order[pos]
+
+
 def winner_id(match: Any) -> int | None:
     """比分为两个不等的非空整数时才有胜者。"""
     s1 = match["score1"] if "score1" in match.keys() else None  # noqa: SIM118

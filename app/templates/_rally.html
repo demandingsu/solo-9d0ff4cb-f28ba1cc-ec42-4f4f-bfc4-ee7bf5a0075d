@@ -1,0 +1,130 @@
+{# 决赛逐分记分面板：首页决赛区与场次记分页共用，保证两处操作同一进度。 #}
+{% macro rally_panel(m, rally, conflict=None, origin='match') %}
+{% if m and rally %}
+<div class="rally-panel" id="rally-{{ m.id }}"
+     data-testid="rally-panel-{{ m.id }}"
+     data-revision="{{ rally.revision if rally.exists else '' }}">
+
+  {% if conflict %}
+  <div class="alert alert-stale" role="alert" data-testid="rally-stale-warning">
+    <strong>⚠️ 这次操作未生效：</strong>{{ conflict }}
+    <div class="stale-actions">
+      <button type="button" class="btn btn-primary"
+              onclick="window.location.reload()">刷新本页</button>
+      <a class="btn btn-ghost" href="{{ url_for('web.index') }}">回到裁判台</a>
+    </div>
+    <p class="hint">两张页面共用同一进度：另一张页面已经先加/撤了一分。即使比分看起来回到了原样（版本号已变），旧页面也必须刷新后再提交。</p>
+  </div>
+  {% endif %}
+
+  {% if rally.exists %}
+  <div class="rally-board" data-testid="rally-board-{{ m.id }}">
+    <div class="rally-head">
+      <h3>决赛逐分记分</h3>
+      <span class="badge badge-active" data-testid="rally-revision">
+        进度版本 r{{ rally.revision }}
+      </span>
+    </div>
+
+    <div class="rally-score" data-testid="rally-score">
+      <div class="rally-side {{ 'serving' if rally.serving_side == 1 and not rally.finished else '' }}">
+        <span class="pname">{{ m.player1_name }}</span>
+        <strong data-testid="rally-score-1">{{ rally.score1 }}</strong>
+      </div>
+      <span class="rally-colon">:</span>
+      <div class="rally-side {{ 'serving' if rally.serving_side == 2 and not rally.finished else '' }}">
+        <strong data-testid="rally-score-2">{{ rally.score2 }}</strong>
+        <span class="pname">{{ m.player2_name }}</span>
+      </div>
+    </div>
+
+    {% if rally.finished %}
+      <p class="rally-serving finished" data-testid="rally-finished">
+        🏁 本场结束：<strong>{{ m.player1_name if rally.winner_side == 1 else m.player2_name }}</strong>
+        以 {{ rally.score1 }} : {{ rally.score2 }} 获胜。停止加分；如需更正，可撤回最近一分。
+      </p>
+    {% else %}
+      <p class="rally-serving" data-testid="rally-serving">
+        🎾 应发球员：
+        <strong data-testid="rally-serving-name">{{ m.player1_name if rally.serving_side == 1 else m.player2_name }}</strong>
+        <span class="hint">
+          （每打两分换发{% if rally.score1 >= 10 and rally.score2 >= 10 %}；10 平后每分换发{% endif %}；
+          首发：{{ m.player1_name if rally.first_server == 1 else m.player2_name }}）
+        </span>
+      </p>
+    {% endif %}
+
+    {% if m.status == 'active' %}
+      <div class="rally-actions">
+        <form method="post" class="inline-form"
+              action="{{ url_for('web.rally_point', match_id=m.id) }}"
+              data-testid="rally-point-form-1">
+          <input type="hidden" name="side" value="1">
+          <input type="hidden" name="revision" value="{{ rally.revision }}">
+          <input type="hidden" name="origin" value="{{ origin }}">
+          <button type="submit" class="btn btn-primary"
+                  data-testid="rally-point-1"
+                  {{ 'disabled' if rally.finished or not rally.active else '' }}>
+            {{ m.player1_name }} +1
+          </button>
+        </form>
+        <form method="post" class="inline-form"
+              action="{{ url_for('web.rally_point', match_id=m.id) }}"
+              data-testid="rally-point-form-2">
+          <input type="hidden" name="side" value="2">
+          <input type="hidden" name="revision" value="{{ rally.revision }}">
+          <input type="hidden" name="origin" value="{{ origin }}">
+          <button type="submit" class="btn btn-primary"
+                  data-testid="rally-point-2"
+                  {{ 'disabled' if rally.finished or not rally.active else '' }}>
+            {{ m.player2_name }} +1
+          </button>
+        </form>
+        <form method="post" class="inline-form"
+              action="{{ url_for('web.rally_undo', match_id=m.id) }}"
+              data-testid="rally-undo-form">
+          <input type="hidden" name="revision" value="{{ rally.revision }}">
+          <input type="hidden" name="origin" value="{{ origin }}">
+          <button type="submit" class="btn btn-warn"
+                  data-testid="rally-undo"
+                  {{ 'disabled' if not rally.can_undo or not rally.active else '' }}>
+            ↩ 撤回最近一分{% if rally.can_undo %}（{{ m.player1_name if rally.last_point_side == 1 else m.player2_name }}）{% endif %}
+          </button>
+        </form>
+      </div>
+      <p class="hint">本方发球两分后换发；10 平起每分换发。一方至少 11 分且领先 2 分时停止加分。</p>
+    {% else %}
+      <p class="hint">该决赛场次已撤下，逐分记分入口关闭。</p>
+    {% endif %}
+  </div>
+  {% elif rally.can_start %}
+  <form method="post" class="rally-start-form"
+        action="{{ url_for('web.rally_start', match_id=m.id) }}"
+        data-testid="rally-start-form">
+    <h3>决赛逐分记分</h3>
+    <p class="hint">先选定首发球员，再逐分给球员加分。开启后本场不再接受整场比分录入。</p>
+    <input type="hidden" name="origin" value="{{ origin }}">
+    <label>首发球员
+      <select name="first_server" aria-label="首发球员" required>
+        <option value="1">{{ m.player1_name }}</option>
+        <option value="2">{{ m.player2_name }}</option>
+      </select>
+    </label>
+    <button type="submit" class="btn btn-primary" data-testid="rally-start">
+      开启逐分记分
+    </button>
+  </form>
+  {% else %}
+    {% if not m.round == 'F' %}
+    <p class="hint" data-testid="rally-unavailable">逐分记分只用于决赛。</p>
+    {% elif m.status != 'active' %}
+    <p class="hint" data-testid="rally-unavailable">该场次已撤下，不能开启逐分记分。</p>
+    {% elif m.score1 is not none or m.score2 is not none %}
+    <p class="hint" data-testid="rally-unavailable">
+      本场已登记整场比分，无法再开启逐分记分。
+    </p>
+    {% endif %}
+  {% endif %}
+</div>
+{% endif %}
+{% endmacro %}
