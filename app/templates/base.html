@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}社区乒乓球赛 · 裁判台{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="wrap topbar-inner">
+    <a class="brand" href="{{ url_for('web.index') }}">
+      <span class="logo">🏓</span>
+      <span>社区乒乓球赛 · 裁判台</span>
+    </a>
+    <nav class="nav">
+      <a href="{{ url_for('web.index') }}">裁判台</a>
+      <a href="{{ url_for('web.history') }}">历史对阵 / 撤场记录</a>
+      <a href="{{ url_for('web.api_state') }}">JSON 状态</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="flashes" data-testid="flashes">
+        {% for category, message in messages %}
+          <div class="flash flash-{{ category }}">{{ message }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+
+  {% block content %}{% endblock %}
+
+  <footer class="footer">
+    数据保存在 SQLite · 小组六场整表提交 · 半决赛按场登记 ·
+    换台比分随人走，撤下记录可查，重新配对从零记分
+  </footer>
+</main>
+</body>
+</html>

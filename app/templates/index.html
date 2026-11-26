@@ -1,0 +1,245 @@
+{% extends "base.html" %}
+{% block content %}
+
+{% macro score_form(m, compact=False) %}
+<form method="post" class="score-form"
+      action="{{ url_for('web.match_score', match_id=m.id) }}"
+      data-testid="score-form-{{ m.id }}">
+  <div class="score-inputs">
+    <input type="number" name="score1" min="0" max="999" inputmode="numeric"
+           value="{{ m.score1 if m.score1 is not none else '' }}"
+           aria-label="{{ m.player1_name }} 得分" placeholder="0">
+    <span class="colon">:</span>
+    <input type="number" name="score2" min="0" max="999" inputmode="numeric"
+           value="{{ m.score2 if m.score2 is not none else '' }}"
+           aria-label="{{ m.player2_name }} 得分" placeholder="0">
+  </div>
+  <button type="submit" class="btn btn-primary">
+    {{ '更正比分' if (m.score1 is not none or m.score2 is not none) else '登记比分' }}
+  </button>
+</form>
+{% endmacro %}
+
+<!-- ========================= 小组赛 ========================= -->
+<section class="panel" id="groups">
+  <div class="panel-head">
+    <h2>① 小组赛（A / B 各三人单循环，共六场）</h2>
+    <p class="hint">一张整表一次录入或更正全部六场比分，提交后排名与半决赛对阵立即更新。未赛场次可留空。</p>
+  </div>
+
+  {% if group_errors %}
+  <div class="alert alert-error" data-testid="group-errors">
+    <strong>整表未保存：</strong>{{ group_errors[0] }}
+  </div>
+  {% endif %}
+
+  <div class="grid-2">
+    {% for g in ['A', 'B'] %}
+    <div class="card">
+      <h3>{{ g }} 组积分榜</h3>
+      <table class="table standings" data-testid="standings-{{ g }}">
+        <thead>
+          <tr><th>名次</th><th>抽签号</th><th>球员</th><th>胜场</th><th>负场</th><th>已赛</th><th>得/失</th></tr>
+        </thead>
+        <tbody>
+        {% for r in standings[g] %}
+          <tr class="{{ 'rank-first' if r.rank <= 2 else '' }}">
+            <td><span class="rank-badge rank-{{ r.rank }}">{{ g }}{{ r.rank }}</span></td>
+            <td class="draw-no" data-testid="draw-{{ r.id }}">{{ r.draw_no }}</td>
+            <td class="player-name">{{ r.name }}</td>
+            <td class="wins" data-testid="wins-{{ r.id }}"><strong>{{ r.wins }}</strong></td>
+            <td>{{ r.losses }}</td>
+            <td>{{ r.played }}</td>
+            <td class="muted">{{ r.points_for }}/{{ r.points_against }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      <p class="hint">排名规则：胜场多者在前；胜场相同，抽签号小者在前。</p>
+    </div>
+    {% endfor %}
+  </div>
+
+  <form method="post" action="{{ url_for('web.groups_scores') }}"
+        class="card group-form" data-testid="group-score-form">
+    <h3>六场比分整表录入 / 更正</h3>
+    <div class="match-rows">
+      {% for gm in group_matches %}
+      {% set d = draft.get(gm.id) %}
+      <div class="match-row" data-testid="group-match-{{ gm.id }}">
+        <span class="group-tag group-{{ gm.group_name }}">{{ gm.group_name }}组</span>
+        <span class="gm-player">
+          <span class="draw-chip">{{ gm.player1_draw }}</span>{{ gm.player1_name }}
+        </span>
+        <input type="number" min="0" max="999" inputmode="numeric"
+               name="score_{{ gm.id }}_p1"
+               value="{{ d[0] if d else (gm.score1 if gm.score1 is not none else '') }}"
+               aria-label="{{ gm.player1_name }} 比分">
+        <span class="colon">:</span>
+        <input type="number" min="0" max="999" inputmode="numeric"
+               name="score_{{ gm.id }}_p2"
+               value="{{ d[1] if d else (gm.score2 if gm.score2 is not none else '') }}"
+               aria-label="{{ gm.player2_name }} 比分">
+        <span class="gm-player">
+          {{ gm.player2_name }}<span class="draw-chip">{{ gm.player2_draw }}</span>
+        </span>
+      </div>
+      {% endfor %}
+    </div>
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary btn-lg" data-testid="group-submit">
+        整表提交六场比分并更新对阵
+      </button>
+    </div>
+  </form>
+</section>
+
+<!-- ========================= 半决赛 / 球台 ========================= -->
+<section class="panel" id="semifinals">
+  <div class="panel-head row-between">
+    <div>
+      <h2>② 半决赛（按场登记）</h2>
+      <p class="hint">默认一号台 A1 对 B2，二号台 B1 对 A2。可对调球台：比分跟随“这对球员/场次”，不会留在球台上。</p>
+    </div>
+    <form method="post" action="{{ url_for('web.swap_tables') }}"
+          data-testid="swap-form"
+          onsubmit="return confirm('确认对调一号台与二号台的现行对阵？各场已录比分保持不变。');">
+      <button type="submit" class="btn btn-warn" data-testid="swap-tables">
+        🔄 对调球台（一 / 二号台互换）
+      </button>
+    </form>
+  </div>
+
+  <div class="grid-2">
+    {% for t in [1, 2] %}
+    {% set m = tables[t] %}
+    <div class="card table-card" id="table-{{ t }}" data-testid="table-card-{{ t }}">
+      <div class="table-card-head">
+        <h3>{{ ['一', '二'][t-1] }}号台</h3>
+        {% if t == 1 %}<span class="rule-tag" data-testid="rule-SF1">默认规则：A1 对 B2</span>
+        {% else %}<span class="rule-tag" data-testid="rule-SF2">默认规则：B1 对 A2</span>{% endif %}
+      </div>
+
+      {% if m %}
+      <div class="active-match" id="match-{{ m.id }}" data-testid="active-match-{{ m.id }}">
+        <div class="match-meta">
+          <span class="match-id">场次 #{{ m.id }}</span>
+          {% if m.bracket_code == 'REPAIR' %}
+            <span class="badge badge-repair">人工重新配对</span>
+          {% elif m.bracket_code %}
+            <span class="badge badge-code">{{ m.bracket_code }}</span>
+          {% endif %}
+          <span class="badge badge-active">现行有效</span>
+        </div>
+
+        <div class="versus">
+          <div class="vs-player">
+            <span class="draw-chip">{{ m.player1_draw }}</span>
+            <span class="pname">{{ m.player1_name }}</span>
+            <span class="group-tag group-{{ m.player1_group }}">{{ m.player1_group }}组</span>
+          </div>
+          <div class="vs-score">
+            {% if m.score1 is not none %}
+              <strong data-testid="score-{{ m.id }}-1">{{ m.score1 }}</strong>
+              <span class="colon">:</span>
+              <strong data-testid="score-{{ m.id }}-2">{{ m.score2 }}</strong>
+            {% else %}
+              <span class="muted">未记分</span>
+            {% endif %}
+          </div>
+          <div class="vs-player vs-player-right">
+            <span class="group-tag group-{{ m.player2_group }}">{{ m.player2_group }}组</span>
+            <span class="pname">{{ m.player2_name }}</span>
+            <span class="draw-chip">{{ m.player2_draw }}</span>
+          </div>
+        </div>
+
+        {{ score_form(m) }}
+
+        <div class="mini-actions">
+          <form method="post" class="inline-form"
+                action="{{ url_for('web.change_table', match_id=m.id) }}"
+                data-testid="move-form-{{ m.id }}">
+            <label>调到
+              <select name="table_no" aria-label="选择球台">
+                <option value="1" {{ 'selected' if m.table_no == 1 else '' }}>一号台</option>
+                <option value="2" {{ 'selected' if m.table_no == 2 else '' }}>二号台</option>
+              </select>
+            </label>
+            <button class="btn btn-ghost btn-sm" type="submit">换台（比分照旧）</button>
+          </form>
+
+          <a class="btn btn-ghost btn-sm"
+             href="{{ url_for('web.match_page', match_id=m.id) }}"
+             data-testid="open-page-{{ m.id }}">本场独立页面（旧页面入口）</a>
+
+          <form method="post" class="inline-form"
+                action="{{ url_for('web.withdraw', match_id=m.id) }}"
+                onsubmit="return confirm('确认撤下场次 #{{ m.id }}？比分将封存，可在历史对阵中查询；旧页面将不能再交分。');">
+            <button class="btn btn-danger btn-sm" type="submit"
+                    data-testid="withdraw-{{ m.id }}">撤下对阵</button>
+          </form>
+        </div>
+      </div>
+      {% else %}
+        <div class="empty-table" data-testid="empty-table-{{ t }}">
+          <p>该球台当前没有现行对阵（可能已撤下，等待重新配对）。</p>
+          <a class="btn btn-ghost btn-sm" href="{{ url_for('web.history') }}">去重新配对</a>
+        </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+
+  {% set untabled = active_semifinals | selectattr('table_no', 'none') | list %}
+  {% if untabled %}
+  <div class="card">
+    <h3>未分配球台的现行半决赛</h3>
+    {% for m in untabled %}
+      <p>场次 #{{ m.id }}：{{ m.player1_name }} 对 {{ m.player2_name }}
+        （<a href="{{ url_for('web.match_page', match_id=m.id) }}">打开记分页</a>）</p>
+    {% endfor %}
+  </div>
+  {% endif %}
+</section>
+
+<!-- ========================= 决赛选手 ========================= -->
+<section class="panel" id="finalists">
+  <div class="card finalists-card" data-testid="finalists">
+    <h2>③ 决赛选手</h2>
+    {% if finalists.ready %}
+      <div class="finalist-row" data-testid="finalist-names">
+        {% for w in finalists.winners %}
+          <span class="finalist">🏅 {{ w.player.name }}
+            <small>（{{ ['一', '二'][w.table_no-1] if w.table_no in [1,2] else '?' }}号台胜者）</small></span>
+          {% if not loop.last %}<span class="vs">VS</span>{% endif %}
+        {% endfor %}
+      </div>
+
+      {% if final_match %}
+      <div class="final-score">
+        <h3>决赛（场次 #{{ final_match.id }}）</h3>
+        <div class="versus">
+          <div class="vs-player"><span class="pname">{{ final_match.player1_name }}</span></div>
+          <div class="vs-score">
+            {% if final_match.score1 is not none %}
+              <strong>{{ final_match.score1 }}</strong> : <strong>{{ final_match.score2 }}</strong>
+            {% else %}<span class="muted">未记分</span>{% endif %}
+          </div>
+          <div class="vs-player"><span class="pname">{{ final_match.player2_name }}</span></div>
+        </div>
+        {{ score_form(final_match) }}
+      </div>
+      {% endif %}
+
+      {% if champion and champion.player %}
+      <div class="champion" data-testid="champion">🏆 冠军：{{ champion.player.name }}</div>
+      {% endif %}
+    {% else %}
+      <p class="pending" data-testid="finalists-pending">⏳ {{ finalists.message }}</p>
+      <p class="hint">当前现行半决赛已记分 {{ finalists.count_scored }} / {{ finalists.count_active }}。</p>
+    {% endif %}
+  </div>
+</section>
+
+{% endblock %}

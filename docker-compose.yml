@@ -1,0 +1,30 @@
+services:
+  referee:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: community-pingpong-referee:latest
+    container_name: pingpong-referee
+    ports:
+      # 宿主机端口可用 PORT 覆盖：PORT=8080 docker compose up
+      - "${PORT:-5000}:5000"
+    environment:
+      DB_PATH: /data/referee.db
+      SECRET_KEY: ${SECRET_KEY:-compose-pingpong-secret-change-me}
+    volumes:
+      - pingpong-sqlite:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - "python3"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/healthz', timeout=3).status == 200 else 1)"
+      interval: 10s
+      timeout: 4s
+      retries: 5
+      start_period: 8s
+
+volumes:
+  pingpong-sqlite:
+    name: pingpong-sqlite-data

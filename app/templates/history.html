@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}历史对阵 / 撤场记录 · 裁判台{% endblock %}
+{% block content %}
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>历史对阵与撤场记录</h2>
+    <p class="hint">所有半决赛/决赛场次都在这里：现行、手动撤下、因小组对阵更新而封存的记录及其比分均可查。重新配对一定产生空白的新场次。</p>
+  </div>
+
+  <div class="card">
+    <h3>重新配对 / 新建配对</h3>
+    <form method="post" action="{{ url_for('web.create_pairing') }}"
+          class="pairing-form" data-testid="new-pairing-form">
+      <select name="player1_id" aria-label="球员一" required>
+        {% for p in players %}
+          <option value="{{ p.id }}">[{{ p.group_name }}组 {{ p.draw_no }}号] {{ p.name }}</option>
+        {% endfor %}
+      </select>
+      <span>对</span>
+      <select name="player2_id" aria-label="球员二" required>
+        {% for p in players %}
+          <option value="{{ p.id }}" {{ 'selected' if loop.index == 4 else '' }}>
+            [{{ p.group_name }}组 {{ p.draw_no }}号] {{ p.name }}
+          </option>
+        {% endfor %}
+      </select>
+      <select name="table_no" aria-label="球台">
+        <option value="">自动安排空台</option>
+        <option value="1">一号台</option>
+        <option value="2">二号台</option>
+      </select>
+      <button class="btn btn-primary" type="submit" data-testid="new-pairing-submit">
+        建立新配对（空白记分）
+      </button>
+    </form>
+  </div>
+
+  <div class="card">
+    <table class="table history-table" data-testid="history-table">
+      <thead>
+        <tr>
+          <th>场次</th><th>轮次</th><th>球台</th><th>对阵</th>
+          <th>比分</th><th>状态</th><th>说明/时间</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for m in matches %}
+        <tr class="{{ 'row-withdrawn' if m.status == 'withdrawn' else '' }}"
+            data-testid="history-row-{{ m.id }}" data-status="{{ m.status }}">
+          <td>#{{ m.id }}</td>
+          <td>
+            {% if m.round == 'SF' %}半决赛
+            {% elif m.round == 'F' %}决赛
+            {% else %}{{ m.round }}{% endif %}
+            {% if m.bracket_code and m.bracket_code != 'REPAIR' %}
+              <span class="badge badge-code">{{ m.bracket_code }}</span>
+            {% elif m.bracket_code == 'REPAIR' %}
+              <span class="badge badge-repair">重配</span>
+            {% endif %}
+          </td>
+          <td>{{ m.table_no if m.table_no in [1,2] else '—' }}{% if m.table_no == 1 %}号台{% elif m.table_no == 2 %}号台{% endif %}</td>
+          <td class="matchup-cell">
+            {{ m.player1_name or '待定' }}
+            <span class="muted">vs</span>
+            {{ m.player2_name or '待定' }}
+          </td>
+          <td class="score-cell" data-testid="history-score-{{ m.id }}">
+            {% if m.score1 is not none %}
+              <strong>{{ m.score1 }} : {{ m.score2 }}</strong>
+            {% else %}
+              <span class="muted">未记分</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if m.status == 'active' %}
+              <span class="badge badge-active">现行</span>
+            {% else %}
+              <span class="badge badge-withdrawn">已撤下</span>
+            {% endif %}
+          </td>
+          <td class="muted small">
+            {% if m.status == 'withdrawn' %}
+              {{ '小组对阵更新封存' if m.withdraw_reason == 'lineup_update' else '手动撤场' }}
+              <br>{{ m.withdrawn_at or '' }}
+            {% else %}
+              创建 {{ m.created_at }}
+            {% endif %}
+          </td>
+          <td class="actions-cell">
+            <a class="btn btn-ghost btn-sm"
+               href="{{ url_for('web.match_page', match_id=m.id) }}">
+              {{ '查看/旧页面' if m.status == 'withdrawn' else '记分页' }}
+            </a>
+            {% if m.status == 'active' %}
+              <form method="post" class="inline-form"
+                    action="{{ url_for('web.withdraw', match_id=m.id) }}"
+                    onsubmit="return confirm('确认撤下场次 #{{ m.id }}？');">
+                <button class="btn btn-danger btn-sm" type="submit"
+                        data-testid="history-withdraw-{{ m.id }}">撤下</button>
+              </form>
+            {% else %}
+              <form method="post" class="inline-form"
+                    action="{{ url_for('web.re_pair', match_id=m.id) }}">
+                <button class="btn btn-warn btn-sm" type="submit"
+                        data-testid="history-repair-{{ m.id }}">同两人重配</button>
+              </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="8" class="muted">暂无淘汰赛记录。请先在裁判台整表提交小组比分。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

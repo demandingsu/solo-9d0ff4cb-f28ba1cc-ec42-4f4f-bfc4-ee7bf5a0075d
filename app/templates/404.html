@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel narrow">
+  <div class="card center">
+    <h2>404 · 找不到该场次</h2>
+    <p>它可能从未存在，或链接编号有误。</p>
+    <a class="btn btn-primary" href="{{ url_for('web.index') }}">回到裁判台</a>
+  </div>
+</section>
+{% endblock %}
